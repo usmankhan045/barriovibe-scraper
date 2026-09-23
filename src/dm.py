@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-from config.banned import violations
+from config.banned import normalise_chars, violations
 from config.services import BY_SLUG
 from src.llm import LLMError
 
@@ -168,7 +168,11 @@ def _strip_wrapping(text: str) -> str:
         if len(paragraphs) > 1:
             text = paragraphs[-1]
 
-    return text.strip()
+    # Typography the model chose (curly quotes, em dashes, non-breaking
+    # hyphens) is fixed here rather than counted as a validation failure.
+    # Regenerating over a character we can replace burns a model call, and on
+    # a free tier that call costs a rate-limit wait as well.
+    return normalise_chars(text)
 
 
 def _validate(text: str, first_name: str) -> list[str]:

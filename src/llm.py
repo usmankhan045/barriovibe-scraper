@@ -75,6 +75,38 @@ PROVIDERS = {
 REQUEST_TIMEOUT_S = 120
 MAX_RETRIES = 4
 
+# A provider's rate limit applies to the API KEY, not to the object holding it.
+# The writer chain and the scorer chain each build their own LLMClient for the
+# same Groq models, so per-instance pacing let two clients fire inside the same
+# window and collect a 429 that neither had any way to see coming. Pacing state
+# therefore lives per provider, shared by every client that talks to it.
+_LAST_CALL_AT: dict[str, float] = {}
+
+# When a model does rate-limit us, that verdict holds for a while. Without a
+# memory of it, every subsequent lead re-tries the same dead model and pays the
+# same multi-second wait before falling through the chain again. Recording the
+# time a model becomes usable again turns that repeated cost into a single one.
+_COOLDOWN_UNTIL: dict[str, float] = {}
+
+# How long to skip a model after it rate-limits us. Short enough that a brief
+# spike does not sideline a good model for the rest of the run.
+COOLDOWN_S = 60.0
+
+
+def seconds_until_any_ready(max_wait: float = COOLDOWN_S) -> float:
+    """How long until at least one cooling-down model is usable again.
+
+    0.0 when nothing is cooling down, so a caller that failed for reasons other
+    than rate limiting retries immediately instead of sleeping for no reason.
+    """
+    if not _COOLDOWN_UNTIL:
+        return 0.0
+    now = time.monotonic()
+    remaining = [until - now for until in _COOLDOWN_UNTIL.values() if until > now]
+    if not remaining:
+        return 0.0
+    return min(min(remaining), max_wait)
+
 
 class LLMError(RuntimeError):
     """Call failed in a way the caller cannot recover from."""
@@ -113,31 +145,35 @@ class FallbackClient:
     def model(self) -> str:
         return self.clients[0].model
 
-    def complete(self, messages: list[dict], **kwargs) -> "LLMResponse":
-        errors: list[str] = []
-        for client in self.clients:
-            try:
-                response = client.complete(messages, **kwargs)
-                if client is not self.clients[0]:
-                    log.warning("Fell back to %s/%s", client.provider, client.model)
-                return response
-            except LLMError as exc:
-                errors.append(f"{client.provider}/{client.model}: {str(exc)[:120]}")
-                continue
-        raise LLMError("All models failed:\n  " + "\n  ".join(errors))
+    def _ordered(self) -> list["LLMClient"]:
+        """Preference order, with cooling-down models moved to the back.
 
-    def complete_json(self, messages: list[dict], **kwargs) -> dict:
+        They are moved rather than dropped: if every model is cooling down we
+        still make the call instead of failing the lead outright.
+        """
+        ready = [c for c in self.clients if not c.cooling_down()]
+        cooling = [c for c in self.clients if c.cooling_down()]
+        return ready + cooling
+
+    def _run(self, method: str, messages: list[dict], kwargs):
         errors: list[str] = []
-        for client in self.clients:
+        clients = self._ordered()
+        for client in clients:
             try:
-                result = client.complete_json(messages, **kwargs)
+                result = getattr(client, method)(messages, **kwargs)
                 if client is not self.clients[0]:
-                    log.warning("Fell back to %s/%s", client.provider, client.model)
+                    log.info("Used %s/%s", client.provider, client.model)
                 return result
             except LLMError as exc:
                 errors.append(f"{client.provider}/{client.model}: {str(exc)[:120]}")
                 continue
         raise LLMError("All models failed:\n  " + "\n  ".join(errors))
+
+    def complete(self, messages: list[dict], **kwargs) -> "LLMResponse":
+        return self._run("complete", messages, kwargs)
+
+    def complete_json(self, messages: list[dict], **kwargs) -> dict:
+        return self._run("complete_json", messages, kwargs)
 
 
 class LLMClient:
@@ -165,10 +201,14 @@ class LLMClient:
         self.api_key = api_key
         self.model = model
         self.dry_run = dry_run
-        self._last_call_at = 0.0
-        # How many times to wait out OUR OWN rate limit before giving up on
-        # this model. Kept low: the fallback chain is the better remedy.
-        self.rate_limit_retries = 2
+        # Rate limits are enforced per API key, so pacing state is keyed by
+        # provider and shared across every client using it.
+        self._pace_key = provider
+        self._cool_key = f"{provider}/{model}"
+        # Do NOT wait out our own rate limit here. Moving to the next model in
+        # the chain is faster than sleeping, and the model that refused us is
+        # now in cooldown so we will not keep paying for it.
+        self.rate_limit_retries = 1
 
         prefix = self.config["key_prefix"]
         if prefix and not api_key.startswith(prefix):
@@ -177,11 +217,25 @@ class LLMClient:
                 f"{self.config['signup']}."
             )
 
+    def cooling_down(self) -> bool:
+        """True if this model rate-limited us recently enough to still skip."""
+        return time.monotonic() < _COOLDOWN_UNTIL.get(self._cool_key, 0.0)
+
+    def _start_cooldown(self) -> None:
+        _COOLDOWN_UNTIL[self._cool_key] = time.monotonic() + COOLDOWN_S
+
+    def _mark_called(self) -> None:
+        _LAST_CALL_AT[self._pace_key] = time.monotonic()
+
     def _wait_turn(self) -> None:
         gap = self.config["min_interval_s"]
-        elapsed = time.monotonic() - self._last_call_at
+        elapsed = time.monotonic() - _LAST_CALL_AT.get(self._pace_key, 0.0)
         if elapsed < gap:
             time.sleep(gap - elapsed)
+        # Claim the slot before the request goes out, so a concurrent client
+        # on the same provider paces against this call rather than the last
+        # completed one.
+        self._mark_called()
 
     def complete(
         self,
@@ -226,7 +280,7 @@ class LLMClient:
             )
             try:
                 with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
-                    self._last_call_at = time.monotonic()
+                    self._mark_called()
                     data = json.loads(resp.read().decode("utf-8"))
 
                 choices = data.get("choices")
@@ -262,7 +316,7 @@ class LLMClient:
                 return LLMResponse(content, self.model, self.provider)
 
             except urllib.error.HTTPError as exc:
-                self._last_call_at = time.monotonic()
+                self._mark_called()
                 detail = exc.read().decode("utf-8", errors="replace")[:400]
 
                 if exc.code == 401:
@@ -288,16 +342,20 @@ class LLMClient:
                         "temporarily rate-limited upstream" in detail
                         or "overloaded" in detail
                     )
+                    # Either way this model is out for now. Record that so
+                    # later leads skip it instead of re-discovering it, and
+                    # hand straight to the next model rather than sleeping:
+                    # the chain is faster than the wait.
+                    self._start_cooldown()
                     if upstream_overloaded or attempt >= self.rate_limit_retries:
+                        log.info(
+                            "%s/%s rate limited, cooling down %.0fs",
+                            self.provider, self.model, COOLDOWN_S,
+                        )
                         raise RateLimited(
                             f"{self.provider}/{self.model} unavailable: "
                             f"{'upstream overloaded' if upstream_overloaded else 'rate limited'}"
                         ) from exc
-                    wait = min(20, 5 * attempt)
-                    log.info(
-                        "%s rate limited, waiting %ss", self.provider, wait
-                    )
-                    time.sleep(wait)
                     last_error = RateLimited(detail)
                     continue
 
@@ -320,7 +378,7 @@ class LLMClient:
                             self.provider, exc.code, attempt, MAX_RETRIES)
 
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                self._last_call_at = time.monotonic()
+                self._mark_called()
                 last_error = exc
                 log.warning("%s call failed (attempt %s/%s): %s",
                             self.provider, attempt, MAX_RETRIES, exc)

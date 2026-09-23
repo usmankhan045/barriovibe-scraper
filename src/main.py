@@ -54,7 +54,13 @@ from src.budget import (
 )
 from src.discord import DiscordSender
 from src.dm import DMWriter, DMWriterError
-from src.llm import SCORER_CHAIN, WRITER_CHAIN, LLMError, build_chain
+from src.llm import (
+    SCORER_CHAIN,
+    WRITER_CHAIN,
+    LLMError,
+    build_chain,
+    seconds_until_any_ready,
+)
 from src.qualify import Qualifier
 from src.queryplan import plan_run, plan_summary
 from src.seen import SeenStore
@@ -311,7 +317,11 @@ def run(settings, *, limit: int | None = None) -> int:
     unwritten = [x for x in leads if x.get("message", "").startswith("[No message")]
     if unwritten:
         log.info("Retrying %s messages that failed on the first pass", len(unwritten))
-        time.sleep(20)
+        # Wait only as long as the writer chain is actually unavailable. A
+        # fixed sleep either wastes time the models did not need or expires
+        # before the limit clears; the cooldown registry already knows when
+        # the first model comes back.
+        time.sleep(seconds_until_any_ready())
         for lead in unwritten:
             try:
                 lead["message"] = writer.write(lead).text

@@ -21,19 +21,69 @@ import re
 
 # ---------------------------------------------------------------------------
 # 1. Characters that read as machine-written.
+#
+# These are a typography problem, not a writing problem: the sentence around a
+# curly apostrophe is exactly as good as the same sentence with a straight one.
+# Rejecting a whole generation over one costs a full model call (and, on a free
+# tier, a rate-limit wait) to buy back a character we can simply replace. So
+# they are NORMALISED before validation rather than rejected, and no longer
+# appear in `violations()`.
+#
+# The em dash is deliberately mapped to ", " rather than "-": an em dash joins
+# two clauses, and a hyphen between clauses reads as a typo where a comma reads
+# as normal writing.
 # ---------------------------------------------------------------------------
-BANNED_CHARS: tuple[tuple[str, str], ...] = (
-    ("\u2014", "em dash"),
-    ("\u2013", "en dash"),
-    ("\u2011", "non-breaking hyphen"),
-    ("\u2012", "figure dash"),
-    ("\u2015", "horizontal bar"),
-    ("\u2018", "curly apostrophe"),
-    ("\u2019", "curly apostrophe"),
-    ("\u201c", "curly quote"),
-    ("\u201d", "curly quote"),
-    ("\u2026", "ellipsis character"),
+CHAR_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("\u2014", ", "),   # em dash
+    ("\u2013", "-"),    # en dash
+    ("\u2011", "-"),    # non-breaking hyphen
+    ("\u2012", "-"),    # figure dash
+    ("\u2015", "-"),    # horizontal bar
+    ("\u2018", "'"),    # curly open single
+    ("\u2019", "'"),    # curly apostrophe
+    ("\u201a", "'"),    # single low quote
+    ("\u201c", '"'),    # curly open double
+    ("\u201d", '"'),    # curly close double
+    ("\u201e", '"'),    # double low quote
+    ("\u2026", "..."),  # ellipsis
+    ("\u00a0", " "),    # non-breaking space
+    ("\u202f", " "),    # narrow no-break space
+    ("\u2009", " "),    # thin space
+    ("\u200b", ""),     # zero-width space
+    ("\ufeff", ""),     # BOM / zero-width no-break space
+    ("\u2032", "'"),    # prime
+    ("\u2033", '"'),    # double prime
+    ("\u00ab", '"'),    # guillemets
+    ("\u00bb", '"'),
 )
+
+_CHAR_TABLE = {ord(bad): good for bad, good in CHAR_REPLACEMENTS}
+
+
+def normalise_chars(text: str | None) -> str:
+    """Replace machine-looking typography with its plain-ASCII equivalent.
+
+    Applied to model output before validation. Idempotent, so it is safe to
+    call more than once on the same string.
+    """
+    if not text:
+        return ""
+
+    # A non-breaking hyphen sitting between two letters is almost always a
+    # mangled apostrophe ("it\u2011s", "don\u2011t"), not a real hyphen. Mapping it
+    # to "-" would produce "it-s". Handle that case before the table.
+    text = re.sub(r"(?<=[A-Za-z])\u2011(?=(?:s|t|re|ve|ll|d|m)\b)", "'", text)
+
+    text = text.translate(_CHAR_TABLE)
+    # An em dash mapped to ", " can collide with a comma the model already
+    # wrote, or land before existing punctuation.
+    text = re.sub(r",\s*,+", ",", text)
+    text = re.sub(r"\s+,", ",", text)
+    text = re.sub(r",\s*([.!?;:])", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # An em dash at the very start of a line becomes a stray leading comma.
+    text = re.sub(r"(?m)^\s*,\s*", "", text)
+    return text.strip()
 
 # ---------------------------------------------------------------------------
 # 2. Opening formulas. Nearly every AI-written cold message starts with one,
@@ -222,10 +272,6 @@ def violations(text: str | None) -> list[str]:
 
     found: list[str] = []
     lowered = text.lower()
-
-    for char, label in BANNED_CHARS:
-        if char in text:
-            found.append(f"{label} ({char!r})")
 
     for phrase, category in ALL_BANNED:
         if phrase in lowered:
