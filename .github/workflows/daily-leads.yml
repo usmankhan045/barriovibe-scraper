@@ -1,0 +1,112 @@
+name: Daily lead run
+
+# NOT ENABLED. The schedule below is commented out, so this workflow only runs
+# when triggered by hand from the Actions tab. Uncomment the `schedule` block
+# when you want it to start running on its own.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: scrape and score, send nothing to Discord, save nothing"
+        type: boolean
+        default: false
+      budget:
+        description: "Apify spend cap for this run, in USD"
+        type: string
+        default: "1.00"
+      limit:
+        description: "Process at most N posts (leave blank for no limit)"
+        type: string
+        default: ""
+
+  # ---------------------------------------------------------------------
+  # To enable daily runs, uncomment these three lines.
+  #
+  # 19:37 UTC is chosen deliberately:
+  #   - EU, UK and Gulf have finished their working day, so their morning
+  #     posts are caught the same day rather than 24h stale
+  #   - the US East morning and midday peak (14:00-16:00 UTC) is 3-5 hours old
+  #   - :37 rather than :00 because GitHub delays scheduled jobs most at the
+  #     top of the hour, when everyone else schedules
+  #   - weekdays only: B2B posting volume collapses at weekends, and a run
+  #     that finds nothing still costs money in empty-query charges
+  # ---------------------------------------------------------------------
+  # schedule:
+  #   - cron: "37 19 * * 1-5"
+
+# Only one run at a time. Two concurrent runs would both read the same
+# seen.json, find the same leads, and send duplicates.
+concurrency:
+  group: daily-leads
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to commit the updated dedup store
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No dependencies to install: the pipeline uses only the standard
+      # library, which keeps the run fast and removes a class of failure.
+      - name: Verify configuration
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # Fails fast on a missing or malformed credential, before anything
+          # is spent. Output is masked.
+          python3 -m src.settings
+
+      - name: Run pipeline
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DAILY_BUDGET_USD: ${{ inputs.budget || '1.00' }}
+          SCORE_GATE: "55"
+          POSTED_LIMIT: "24h"
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.limit }}" ]; then
+            ARGS="--limit ${{ inputs.limit }}"
+          fi
+          python3 -u -m src.main $ARGS
+
+      - name: Commit dedup store
+        # Runs even if the pipeline failed partway: leads already delivered
+        # must not be re-sent tomorrow just because a later step broke.
+        if: always() && inputs.dry_run != true
+        run: |
+          if [ -n "$(git status --porcelain data/seen.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/seen.json
+            git commit -m "Update dedup store [skip ci]"
+            git push
+          else
+            echo "No change to the dedup store."
+          fi
+
+      - name: Save spend ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spend-${{ github.run_number }}
+          path: data/runs/
+          retention-days: 30
+          if-no-files-found: ignore

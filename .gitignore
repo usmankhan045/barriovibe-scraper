@@ -1,0 +1,20 @@
+# Credentials — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Run artifacts
+data/runs/
+*.log
+
+# Cached Apify responses. Excluded for two reasons: they contain scraped
+# personal data (names, headlines, post text) that should not enter git
+# history, and they grow without bound.
+#
+# data/seen.json is deliberately NOT ignored: the dedup store must persist
+# between GitHub Actions runs, and committing it is how that happens.
+data/cache/
